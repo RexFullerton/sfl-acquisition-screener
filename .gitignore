@@ -1,0 +1,29 @@
+# Raw county data files (large, not for version control)
+data/raw/
+*.zip
+
+# Cached GeoJSON (auto-downloaded on first run)
+data/fl_zips.geojson
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# Streamlit secrets
+.streamlit/secrets.toml
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
