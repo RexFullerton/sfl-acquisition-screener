@@ -2,8 +2,15 @@
 data/raw/
 *.zip
 
-# Cached GeoJSON (auto-downloaded on first run)
-data/fl_zips.geojson
+# Derived outputs — regenerate with data_pipeline.py / backtest.py.
+# parcels.csv carries real owner names & mailing addresses from public
+# records; not committing it by default even though the source is public.
+data/parcels.csv
+data/backtest_results.csv
+data/historical_sales.csv
+
+# Claude Code local session config (permissions allowlist, not project source)
+.claude/
 
 # Python
 __pycache__/
