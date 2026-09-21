@@ -1,5 +1,11 @@
 # South Florida Wholesale Deal Finder
 
+> **Status:** Validation is pending receipt of multi-year historical NAL/SDF
+> files from a Florida DOR public-records request (submitted; turnaround
+> unknown). Current results are based on a single assessment year with a
+> ~20-month sale-history window — see "Historical data" and "Known
+> limitations" below before treating any number here as final.
+
 ## What this is
 
 A residential acquisition-screening tool for off-market wholesale deals in
