@@ -74,6 +74,39 @@ Three signals, computed per parcel from the NAL file:
   silently contributed a constant score to every parcel and compressed the
   output's grade distribution. A signal that isn't measured isn't scored.
 
+## Qualification codes — the arm's-length definition, verified across 2015-2025
+
+`historical_sales.py` stacks Miami-Dade SDF (Sale Data File) records from 10
+Final-roll vintages (2016F-2025F, received via DOR public-records request),
+covering sale dates 2015-01 through 2025-12. Every sale carries a DOR
+`QUAL_CD`. Two codes are treated as arm's-length and usable as comps or
+back-test outcomes — everything else is excluded:
+
+| Code | Meaning | Arm's-length? |
+|---|---|---|
+| `01` | Qualified arm's length — examination of the deed/instrument | **Yes** |
+| `02` | Qualified arm's length — documented evidence | **Yes** |
+| `03`-`06` | Arm's length at time of transfer, but excluded from DOR's own sales-ratio analysis (property/legal characteristics changed, multi-parcel, crosses county lines) | No |
+| `11`-`21` | Disqualified by deed type (corrective/quitclaim/tax deed, foreclosure-related, government, bankruptcy, utility, contract-for-deed, etc.) | No |
+| `30`-`43` | Disqualified by documented evidence (related-party, forced sale, atypical financing, etc.) | No |
+| `98`-`99` | Qualification decision pending / unresolved | No |
+
+**This mapping was checked against three actual DOR document vintages, not
+assumed to be constant**: the code list effective 2015-01-01 (Rev.
+10-03-2014), 2018-01-01 (Rev. 11-17-2017), and 2024-01-01 (Rev. 9-14-2023).
+DOR no longer hosts the first two live; they were retrieved via the Wayback
+Machine. **Codes `01`/`02` are worded identically in all three** — the
+arm's-length definition has not changed across the whole 2015-2025 window
+this project uses. One real change did turn up: code `21` ("Contract for
+Deed; Agreement for Deed") was added in the 2018 revision and does not exist
+in the 2015 vintage — it's a disqualified code regardless, so it doesn't
+affect the arm's-length set, but a sale recorded before 2018 could not have
+carried it.
+
+- 2015 vintage: [web.archive.org/web/20180426230727/.../salequalcodes_bef01012016.pdf](https://web.archive.org/web/20180426230727/http://floridarevenue.com/property/Documents/salequalcodes_bef01012016.pdf)
+- 2018 vintage: [web.archive.org/web/20210621225107/.../salequalcodes_bef01012019.pdf](https://web.archive.org/web/20210621225107/https://floridarevenue.com/property/Documents/salequalcodes_bef01012019.pdf)
+- 2024 vintage (live): [floridarevenue.com/property/Documents/salequalcodes_bef01012025.pdf](https://floridarevenue.com/property/Documents/salequalcodes_bef01012025.pdf)
+
 ## ARV methodology
 
 Comp-based, built entirely from recorded arm's-length sales in the NAL file

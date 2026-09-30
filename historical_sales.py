@@ -1,218 +1,278 @@
 """
-historical_sales.py — Multi-vintage NAL/SDF sale-history stack. UNVALIDATED.
+historical_sales.py — Multi-year Miami-Dade sale history, built from real DOR records.
 
-Status: written against the known 2025 Miami-Dade NAL schema and the
-Florida DOR 2025 User's Guide's documented SDF layout. No historical NAL
-or SDF file has been available to test this against — a public-records
-request for Miami-Dade NAL + SDF, 2016-2025, has been submitted to DOR
-(PTOTechnology@floridarevenue.com) but not yet fulfilled. Every assumption
-below is provisional until run against real files. In particular:
-  - We have not verified DOR_UC, field names, or field count for any year
-    other than 2025 against that year's own User's Guide. Schema drift is
-    only caught empirically (see check_schema_drift), not pre-verified.
-  - The SDF field layout below is transcribed from the 2025 User's Guide
-    and has never been run against an actual SDF file.
-Do not treat this module's output as ARV/back-test input until it has
-been exercised against real multi-year data and the per-year sale-date
-distributions have been checked (see validate_year_window).
+Validated against real NAL/SDF Final rolls, 2016-2025 (covering sale dates 2015-01
+through 2025-12), received via a Florida DOR public-records request. This replaces
+the earlier untested stub.
 
-Expected input layout once files arrive:
-    data/raw/historical/NAL/<year>/Dade 23 <Final|Preliminary> NAL <year>.zip
-    data/raw/historical/SDF/<year>/Dade 23 <Final|Preliminary> SDF <year>.zip
-(Naming is a guess pending real filenames from the DOR request — adjust
-COUNTY_FILE_PATTERNS below once real files are in hand.)
+Qualification codes (arm's-length definition): verified stable across the whole
+2015-2025 period against three DOR vintages of the "Real Property Transfer
+Qualification Codes" document:
+  - effective 2015-01-01 (Revised 10-03-2014) — via Wayback Machine, DOR no longer
+    hosts this vintage: https://web.archive.org/web/20180426230727/http://floridarevenue.com/property/Documents/salequalcodes_bef01012016.pdf
+  - effective 2018-01-01 (Revised 11-17-2017) — via Wayback Machine:
+    https://web.archive.org/web/20210621225107/https://floridarevenue.com/property/Documents/salequalcodes_bef01012019.pdf
+  - effective 2024-01-01 (Revised 9-14-2023) — live on DOR's site:
+    https://floridarevenue.com/property/Documents/salequalcodes_bef01012025.pdf
+Codes 01 and 02 ("qualified arm's length") are worded identically across all three.
+One real change found: code 21 ("Contract for Deed; Agreement for Deed") was added
+in the 2018 revision and does not exist in the 2015 vintage — it's a disqualified
+code either way, so it does not affect the arm's-length set, but it means a sale
+recorded before 2018 could not have carried that code.
 
-Usage (once files exist):
-    python3 historical_sales.py
+Dedup key, per instruction: sales are only dated to the month in SDF, so
+(parcel_id, sale_year, sale_month, sale_price) alone is not a reliable unique key —
+a recording reference (OR_BOOK/OR_PAGE, or CLERK_NO where the clerk's office uses
+instrument numbering instead) is included.
 """
 
-import re
 import zipfile
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
-HISTORICAL_DIR = Path("data/raw/historical")
-OUTPUT_CSV = Path("data/historical_sales.csv")
+HIST_DIR = Path("data/raw/historical")
+OUTPUT_PARQUET = Path("data/historical_sales.parquet")
 
-# ── 2025 NAL sale fields (verified against DOR's 2025 User's Guide) ────────────
-NAL_SALE_COLS = [
-    "PARCEL_ID", "DOR_UC", "NBRHD_CD",
-    "QUAL_CD1", "SALE_PRC1", "SALE_YR1", "SALE_MO1",
-    "QUAL_CD2", "SALE_PRC2", "SALE_YR2", "SALE_MO2",
-    "TOT_LVG_AREA", "ACT_YR_BLT", "LND_VAL", "JV",
-]
-
-# ── 2025 SDF layout (Section 2 of the User's Guide) — one row per sale, not
-# two slots per parcel. UNTESTED against a real SDF file.
-SDF_COLS = [
-    "PARCEL_ID",       # field 2
-    "ASMNT_YR",        # field 3
-    "DOR_UC",          # field 6
-    "NBRHD_CD",        # field 7
-    "SALE_ID_CD",      # field 10 — unique per transaction, not a slot number
-    "VI_CD",           # field 12
-    "QUAL_CD",         # field 16
-    "SALE_YR",         # field 17
-    "SALE_MO",         # field 18
-    "SALE_PRC",        # field 19
-    "MULTI_PAR_SAL",   # field 20
-]
+YEARS = list(range(2016, 2026))  # Final-roll vintages received; each covers ~18-20mo of sale dates
 
 ARMS_LENGTH_QUAL_CODES = {"01", "02"}
 
-DEDUP_KEY = ["parcel_id", "sale_year", "sale_month", "sale_price", "qual_code"]
+SDF_COLS = [
+    "PARCEL_ID", "DOR_UC", "NBRHD_CD", "SALE_ID_CD", "VI_CD",
+    "OR_BOOK", "OR_PAGE", "CLERK_NO", "QUAL_CD", "SALE_YR", "SALE_MO", "SALE_PRC",
+    "MULTI_PAR_SAL",
+]
+
+NAL_STABILITY_COLS = ["PARCEL_ID", "OWN_NAME", "PHY_ADDR1"]
 
 
-# ── Schema drift detection ──────────────────────────────────────────────────
+# ── Loading ──────────────────────────────────────────────────────────────────
 
-def check_schema_drift(year: int, header: list[str], expected_cols: list[str]) -> list[str]:
+def _read_sdf_year(year: int) -> pd.DataFrame:
+    path = HIST_DIR / "SDF" / f"{year}F.zip"
+    with zipfile.ZipFile(path) as zf:
+        name = zf.namelist()[0]
+        with zf.open(name) as fh:
+            df = pd.read_csv(fh, usecols=SDF_COLS, dtype=str, keep_default_na=False, na_values=[""])
+    for c in df.columns:
+        df[c] = df[c].str.strip()
+    df["source_year"] = year
+    return df
+
+
+def _read_nal_stability_cols(year: int) -> pd.DataFrame:
+    path = HIST_DIR / "NAL" / f"{year}F.zip"
+    with zipfile.ZipFile(path) as zf:
+        name = zf.namelist()[0]
+        with zf.open(name) as fh:
+            df = pd.read_csv(fh, usecols=NAL_STABILITY_COLS, dtype=str, keep_default_na=False, na_values=[""])
+    for c in df.columns:
+        df[c] = df[c].str.strip()
+    return df
+
+
+def _normalize_addr(s: pd.Series) -> pd.Series:
+    s = s.fillna("").str.upper().str.strip()
+    s = s.str.replace(r"[^\w\s]", "", regex=True)
+    s = s.str.replace(r"\s+", " ", regex=True)
+    return s
+
+
+# ── Recording reference ─────────────────────────────────────────────────────
+
+def build_recording_ref(df: pd.DataFrame) -> pd.Series:
     """
-    Compare a year's actual CSV header against the columns this module needs.
-    Returns a list of human-readable problems (empty = no drift detected).
-    Does NOT compare against that year's own official layout doc — we only
-    have 2025's. A clean result here means "usable," not "matches DOR's
-    2018/2020/etc. spec exactly" — that would need each year's own guide.
+    (OR_BOOK, OR_PAGE) when the clerk's office uses that system, else
+    "CLERK:<CLERK_NO>" when it uses instrument numbering, else NA (neither present).
     """
-    problems = []
-    missing = [c for c in expected_cols if c not in header]
-    if missing:
-        problems.append(f"{year}: missing expected columns {missing} — DO NOT silently proceed; "
-                         f"field names or positions may have changed for this vintage.")
-    return problems
+    or_book = df["OR_BOOK"]
+    or_page = df["OR_PAGE"]
+    clerk = df["CLERK_NO"]
+
+    has_orbook = or_book.notna() & (or_book != "")
+    has_clerk = (~has_orbook) & clerk.notna() & (clerk != "")
+
+    ref = pd.Series(pd.NA, index=df.index, dtype="object")
+    ref.loc[has_orbook] = or_book[has_orbook] + "-" + or_page[has_orbook].fillna("")
+    ref.loc[has_clerk] = "CLERK:" + clerk[has_clerk]
+    return ref
 
 
-# ── Sale-date window sanity check ───────────────────────────────────────────
+# ── No-lookahead guard (built now, used starting Step 3) ───────────────────
 
-def validate_year_window(year: int, sale_dates: pd.Series) -> list[str]:
+class LookaheadError(AssertionError):
+    pass
+
+
+def assert_no_lookahead(sales: pd.DataFrame, as_of: pd.Timestamp, sale_date_col: str = "sale_date") -> None:
     """
-    Per the DOR spec, a <year> NAL/SDF submission should only contain sales
-    from roughly [Jan <year-1>, current submission date]. Flag anything
-    that falls well outside that band — that's a "stop and tell me" case,
-    not something to coerce quietly.
+    Raise LookaheadError if any row in `sales` has a sale date on or after `as_of`.
+    Call this on every comp pool / ARV input / score input built for a given as-of
+    date, in steps 3 and 4. A leaking back-test is worse than none — this makes
+    leakage a hard failure, not a hope.
     """
-    problems = []
-    if sale_dates.empty:
-        return problems
-    lo_expected = pd.Timestamp(year=year - 1, month=1, day=1)
-    hi_expected = pd.Timestamp(year=year + 1, month=1, day=1)
-    out_of_band = sale_dates[(sale_dates < lo_expected) | (sale_dates >= hi_expected)]
-    if len(out_of_band) > 0:
-        problems.append(
-            f"{year}: {len(out_of_band)} sale date(s) fall outside the expected "
-            f"[{lo_expected.date()}, {hi_expected.date()}) window for this vintage — "
-            f"stop and inspect before trusting this year's file."
+    if sale_date_col not in sales.columns:
+        raise LookaheadError(f"'{sale_date_col}' column not present — cannot verify no-lookahead.")
+    leaking = sales[sales[sale_date_col] >= as_of]
+    if len(leaking) > 0:
+        raise LookaheadError(
+            f"{len(leaking)} row(s) with sale_date >= as_of ({as_of.date()}) leaked into an "
+            f"as-of-{as_of.date()} input. First offending parcel_id(s): "
+            f"{leaking['parcel_id'].head(5).tolist() if 'parcel_id' in leaking.columns else '(no parcel_id col)'}"
         )
-    return problems
 
 
-# ── NAL -> long sale-event format (mirrors arv.py's _build_sale_events) ────
+# ── Main build ───────────────────────────────────────────────────────────────
 
-def _month_start(year: pd.Series, month: pd.Series) -> pd.Series:
-    month_clamped = month.where(month.between(1, 12))
-    return pd.to_datetime({"year": year, "month": month_clamped, "day": 1}, errors="coerce")
+def build():
+    print("=== Loading SDF, all years ===")
+    frames = []
+    qual_counts_by_year = {}
+    for y in YEARS:
+        df = _read_sdf_year(y)
+        qual_counts_by_year[y] = df["QUAL_CD"].value_counts(dropna=False)
+        df["recording_ref"] = build_recording_ref(df)
+        frames.append(df)
+        print(f"  {y}F: {len(df):,} rows")
 
+    raw = pd.concat(frames, ignore_index=True)
+    total_raw = len(raw)
+    print(f"\nTotal raw SDF rows across all years: {total_raw:,}")
 
-def nal_to_sale_events(nal_df: pd.DataFrame, vintage_year: int) -> pd.DataFrame:
-    """
-    One row per (parcel, slot) sale event, carrying that VINTAGE's own parcel
-    characteristics (not current-roll characteristics) — see README
-    "Historical data" for why period-appropriate characteristics matter.
+    raw["SALE_PRC"] = pd.to_numeric(raw["SALE_PRC"], errors="coerce")
+    raw["SALE_YR"] = pd.to_numeric(raw["SALE_YR"], errors="coerce")
+    raw["SALE_MO"] = pd.to_numeric(raw["SALE_MO"], errors="coerce")
 
-    Never assumes SALE_1 is chronologically later than SALE_2 — the DOR
-    2025 User's Guide states slot selection "is not necessarily based on
-    chronological occurrence." Ordering, wherever it matters downstream,
-    must be derived from the actual date values, exactly as backtest.py
-    already does for the single-year case.
-    """
-    events = []
-    for suffix in ("1", "2"):
-        e = pd.DataFrame({
-            "parcel_id": nal_df["PARCEL_ID"],
-            "vintage_year": vintage_year,
-            "dor_use_code": nal_df["DOR_UC"],
-            "nbrhd_cd": nal_df["NBRHD_CD"],
-            "living_area": pd.to_numeric(nal_df["TOT_LVG_AREA"], errors="coerce"),
-            "year_built": pd.to_numeric(nal_df["ACT_YR_BLT"], errors="coerce"),
-            "just_value": pd.to_numeric(nal_df["JV"], errors="coerce"),
-            "sale_price": pd.to_numeric(nal_df[f"SALE_PRC{suffix}"], errors="coerce"),
-            "sale_year": pd.to_numeric(nal_df[f"SALE_YR{suffix}"], errors="coerce"),
-            "sale_month": pd.to_numeric(nal_df[f"SALE_MO{suffix}"], errors="coerce"),
-            "qual_code": nal_df[f"QUAL_CD{suffix}"],
-            "source": f"NAL_{vintage_year}_slot{suffix}",
-        })
-        events.append(e)
-    out = pd.concat(events, ignore_index=True)
-    out["sale_date"] = _month_start(out["sale_year"], out["sale_month"])
+    no_ref = raw["recording_ref"].isna().sum()
+    print(f"Rows with no recording reference at all (neither OR_BOOK/PAGE nor CLERK_NO): "
+          f"{no_ref:,} ({no_ref/total_raw*100:.2f}%) — these can only be dedup'd/conflict-checked "
+          f"on (parcel, year, month, price), not verified against a recording instrument.")
+
+    print("\n=== Qualification code distribution by year (raw SDF, pre-dedup) ===")
+    for y in YEARS:
+        vc = qual_counts_by_year[y]
+        print(f"  {y}F: " + ", ".join(f"{code}={n:,}" for code, n in vc.items()))
+
+    # ── Dedup ────────────────────────────────────────────────────────────────
+    raw = raw.sort_values("source_year")  # so keep='last' below prefers the later file
+    dedup_key = ["PARCEL_ID", "SALE_YR", "SALE_MO", "SALE_PRC", "recording_ref"]
+
+    exact_dupe_count = raw.duplicated(subset=dedup_key, keep="last").sum()
+    deduped = raw.drop_duplicates(subset=dedup_key, keep="last").copy()
+    print(f"\n=== Dedup step 1: exact duplicates ===")
+    print(f"Exact duplicate rows removed (identical parcel+year+month+price+recording_ref, "
+          f"differing only by which vintage file reported them): {exact_dupe_count:,}")
+    print(f"Remaining after exact-dedup: {len(deduped):,}")
+
+    # Conflict detection: same real transaction (parcel + recording_ref), but the
+    # exact-key dedup above did NOT collapse it -- meaning year/month/price/qual
+    # disagree across vintages for what should be the same recorded instrument.
+    has_ref = deduped["recording_ref"].notna()
+    ref_groups = deduped[has_ref].groupby(["PARCEL_ID", "recording_ref"])
+    group_sizes = ref_groups.size()
+    conflicting_keys = group_sizes[group_sizes > 1]
+    n_conflict_groups = len(conflicting_keys)
+    n_conflict_rows = int(conflicting_keys.sum())
+
+    print(f"\n=== Dedup step 2: conflicting duplicates (same parcel + recording ref, "
+          f"different year/month/price/qual across vintages) ===")
+    print(f"Conflicting transaction groups found: {n_conflict_groups:,} "
+          f"(spanning {n_conflict_rows:,} rows before resolution)")
+
+    if n_conflict_groups > 0:
+        conflict_idx = deduped[has_ref].set_index(["PARCEL_ID", "recording_ref"]).index.isin(conflicting_keys.index)
+        conflict_rows = deduped[has_ref][conflict_idx]
+        # keep the row with the max source_year per (PARCEL_ID, recording_ref) group
+        keep_idx = conflict_rows.groupby(["PARCEL_ID", "recording_ref"])["source_year"].idxmax()
+        rows_to_drop = conflict_rows.index.difference(keep_idx)
+        print(f"Resolved by keeping the row from the latest source_year per conflicting group "
+              f"('prefer the later file'); dropped {len(rows_to_drop):,} superseded rows.")
+        deduped = deduped.drop(index=rows_to_drop)
+    else:
+        print("None found.")
+
+    print(f"\nDistinct sales after full dedup: {len(deduped):,}")
+
+    # ── Harmonized qualified flag ───────────────────────────────────────────
+    deduped["qualified"] = deduped["QUAL_CD"].isin(ARMS_LENGTH_QUAL_CODES)
+
+    # ── Sale date, output schema ────────────────────────────────────────────
+    deduped["sale_date"] = pd.to_datetime(
+        {"year": deduped["SALE_YR"], "month": deduped["SALE_MO"].where(deduped["SALE_MO"].between(1, 12)), "day": 1},
+        errors="coerce",
+    )
+
+    out = deduped.rename(columns={
+        "PARCEL_ID": "parcel_id", "SALE_YR": "sale_year", "SALE_MO": "sale_month",
+        "SALE_PRC": "price", "QUAL_CD": "qual_code", "VI_CD": "vi_code",
+        "DOR_UC": "dor_use_code",
+    })[[
+        "parcel_id", "sale_year", "sale_month", "price", "recording_ref",
+        "qual_code", "qualified", "vi_code", "dor_use_code", "sale_date", "source_year",
+    ]]
+
+    out.to_parquet(OUTPUT_PARQUET, index=False)
+    print(f"\nWrote {len(out):,} deduplicated sales -> {OUTPUT_PARQUET}")
+
+    print("\n=== Qualified (01/02) single-family (DOR_UC=001) sales by sale year, 2015-2025 ===")
+    sf_qualified = out[out["qualified"] & (out["dor_use_code"] == "001")]
+    print(sf_qualified["sale_year"].value_counts().sort_index().to_string())
+
+    print("\n=== Sale-date coverage of the deduplicated table ===")
+    print(f"min: {out['sale_date'].min()}   max: {out['sale_date'].max()}")
+
     return out
 
 
-def sdf_to_sale_events(sdf_df: pd.DataFrame, vintage_year: int) -> pd.DataFrame:
-    """UNTESTED — no real SDF file has been available to run this against."""
-    out = pd.DataFrame({
-        "parcel_id": sdf_df["PARCEL_ID"],
-        "vintage_year": vintage_year,
-        "dor_use_code": sdf_df["DOR_UC"],
-        "nbrhd_cd": sdf_df["NBRHD_CD"],
-        "living_area": pd.NA,   # SDF carries no living-area field — must be joined from that vintage's NAL
-        "year_built": pd.NA,
-        "just_value": pd.NA,
-        "sale_price": pd.to_numeric(sdf_df["SALE_PRC"], errors="coerce"),
-        "sale_year": pd.to_numeric(sdf_df["SALE_YR"], errors="coerce"),
-        "sale_month": pd.to_numeric(sdf_df["SALE_MO"], errors="coerce"),
-        "qual_code": sdf_df["QUAL_CD"],
-        "source": f"SDF_{vintage_year}_{sdf_df.get('SALE_ID_CD', '')}",
-    })
-    out["sale_date"] = _month_start(out["sale_year"], out["sale_month"])
-    return out
+# ── Parcel ID stability across NAL vintages ────────────────────────────────
 
+def parcel_stability_report():
+    print("\n=== Parcel ID stability across NAL vintages, 2016-2025 ===")
+    nal = {y: _read_nal_stability_cols(y) for y in YEARS}
+    id_sets = {y: set(nal[y]["PARCEL_ID"]) for y in YEARS}
 
-# ── Dedup across vintages ───────────────────────────────────────────────────
+    all_ids = set.union(*id_sets.values())
+    in_all_years = set.intersection(*id_sets.values())
+    print(f"Union of parcel IDs across all 10 years: {len(all_ids):,}")
+    print(f"Parcel IDs present in EVERY year (2016-2025): {len(in_all_years):,} "
+          f"({len(in_all_years)/len(all_ids)*100:.1f}% of the union)")
 
-def dedup_sale_events(events: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    One row per distinct sale, keyed on DEDUP_KEY. Returns (deduped, conflicts).
+    total_disappear = 0
+    total_matched_new_id = 0
+    total_true_drop = 0
+    for y in YEARS[:-1]:
+        y2 = y + 1
+        disappearing = id_sets[y] - id_sets[y2]
+        if not disappearing:
+            continue
+        left = nal[y][nal[y]["PARCEL_ID"].isin(disappearing)].copy()
+        left["addr_key"] = _normalize_addr(left["OWN_NAME"].fillna("") + "|" + left["PHY_ADDR1"].fillna(""))
 
-    `conflicts`: groups sharing (parcel_id, sale_year, sale_month) but with
-    MORE THAN ONE distinct sale_price — these are not resolved automatically.
-    Report them; a human (or a follow-up rule, decided explicitly) picks.
-    """
-    events = events.dropna(subset=["parcel_id", "sale_year", "sale_month", "sale_price", "qual_code"])
-    deduped = events.drop_duplicates(subset=DEDUP_KEY, keep="first").copy()
+        right_keys = set(
+            _normalize_addr(nal[y2]["OWN_NAME"].fillna("") + "|" + nal[y2]["PHY_ADDR1"].fillna(""))
+        )
+        matched = left["addr_key"].isin(right_keys).sum()
+        dropped = len(left) - matched
+        total_disappear += len(left)
+        total_matched_new_id += matched
+        total_true_drop += dropped
+        print(f"  {y}->{y2}: {len(left):,} parcel IDs disappeared; {matched:,} have the same "
+              f"(owner name + situs address) reappearing under a different ID in {y2} "
+              f"(likely split/combine/renumber); {dropped:,} do not match anything in {y2} "
+              f"(true drop — combined into a parcel with a different address representation, "
+              f"or genuinely removed from the roll).")
 
-    price_variety = (
-        deduped.groupby(["parcel_id", "sale_year", "sale_month"])["sale_price"]
-        .nunique()
-    )
-    conflicting_keys = price_variety[price_variety > 1].index
-    conflicts = deduped[
-        deduped.set_index(["parcel_id", "sale_year", "sale_month"]).index.isin(conflicting_keys)
-    ].sort_values(["parcel_id", "sale_year", "sale_month"])
-
-    return deduped, conflicts
-
-
-# ── Entry point ──────────────────────────────────────────────────────────────
-
-def run():
-    if not HISTORICAL_DIR.exists() or not any(HISTORICAL_DIR.rglob("*.zip")):
-        print(f"No historical NAL/SDF files found under {HISTORICAL_DIR}/.")
-        print("This module is unvalidated and has nothing to ingest yet — "
-              "waiting on the Florida DOR public-records request "
-              "(NAL + SDF, Miami-Dade, 2016-2025) to be fulfilled.")
-        return
-
-    # Real ingestion loop intentionally not fleshed out further: without a
-    # real file in hand, hardcoding a zip-member-name / column-order
-    # assumption beyond what's already verified for 2025 would be guessing,
-    # not engineering. Wire this up against the first real file that lands,
-    # then run check_schema_drift / validate_year_window before trusting it.
-    raise NotImplementedError(
-        "Historical files detected but the ingestion loop is not wired up yet — "
-        "this needs to be written against the real file names/layout DOR sends back, "
-        "not guessed in advance."
-    )
+    print(f"\nTotals across all 9 year-to-year transitions: {total_disappear:,} disappearances, "
+          f"{total_matched_new_id:,} likely renumbered ({total_matched_new_id/total_disappear*100:.1f}%), "
+          f"{total_true_drop:,} true drops ({total_true_drop/total_disappear*100:.1f}%).")
+    print("Sales tied to a 'likely renumbered' old parcel_id are NOT automatically relinked to "
+          "the new ID in historical_sales.py -- flagging this here rather than silently dropping "
+          "or silently merging. Relinking would need a decision on which ID to canonicalize on; "
+          "not done without sign-off.")
 
 
 if __name__ == "__main__":
-    run()
+    build()
+    parcel_stability_report()
