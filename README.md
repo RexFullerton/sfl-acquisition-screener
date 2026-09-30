@@ -1,373 +1,335 @@
-# South Florida Wholesale Deal Finder
+# South Florida Acquisition Screener
 
-> **Status:** Validation is pending receipt of multi-year historical NAL/SDF
-> files from a Florida DOR public-records request (submitted; turnaround
-> unknown). Current results are based on a single assessment year with a
-> ~20-month sale-history window — see "Historical data" and "Known
-> limitations" below before treating any number here as final.
+A screening tool for Miami-Dade single-family homes, built entirely on Florida
+Department of Revenue (DOR) public tax-roll data. It estimates an after-repair
+value (ARV) for each parcel from comparable sales, compares that to the
+county's assessed value, and ranks parcels by the gap. It runs locally as a
+Streamlit app.
 
-## What this is
+The main work is the back-test. I tested whether the ranking and three common
+"motivated seller" signals (absentee owner, long ownership tenure, equity)
+predict what actually happened to these homes in 2018–2023, using only data
+that existed at each valuation date. The short version:
 
-A residential acquisition-screening tool for off-market wholesale deals in
-South Florida. It ingests county public-records data, computes distress
-signals and a comp-based ARV (after-repair value) at the individual-parcel
-level, and ranks properties by estimated spread between that ARV and their
-current assessed value. It runs locally as a Streamlit app.
+- The ARV engine lands within about 10% median error of actual sale prices
+  for 2018–2020, and 15.7% for 2021.
+- The spread ranking predicts which sales close well below the estimated ARV,
+  with a caveat about self-consistency (below). It does not predict whether a
+  home sells at all.
+- Absentee ownership predicts nothing usable. Homes with no recorded sale since
+  2015 were **less** likely to sell, not more.
+- A look-ahead leak in the first version of the ARV engine overstated accuracy.
+  It was found, fixed, and verified with a delete-the-future test.
 
-v1 is scoped to **Miami-Dade County, single-family homes only**. The
-ingestion code is written to be multi-county (Broward and Palm Beach are
-wired up, using the same Florida DOR data format), but only Miami-Dade has
-been validated end-to-end — see "Known limitations."
+Every number below comes from `backtest_discount.py`,
+`verify_lookahead_fix.py`, and `historical_sales.py` as committed.
 
-## Data sources
+## Data
 
-| Source | Agency | What it provides | Access |
-|---|---|---|---|
-| NAL (Name-Address-Legal) bulk file, 2025 | Florida Department of Revenue / Miami-Dade Property Appraiser | Parcel ID, situs & mailing address, owner name, land use code, living area, year built, assessed/just value, and the two most recent recorded sales (price, date, arm's-length qualification code) per parcel | Free bulk download, `.zip` per county, from the Florida DOR property tax data portal |
-| Delinquent Real Estate Property Taxes notice | Miami-Dade Tax Collector | Annual public-notice list of delinquent parcels ahead of the June 1 tax certificate sale | Free PDF, published annually — **not yet ingested, see limitations** |
+**Source.** Florida DOR Name-Address-Legal (NAL) and Sale Data File (SDF)
+Final rolls for Miami-Dade, vintages 2016 through 2025. DOR only posts the
+current year for download, so the prior years came from a public-records
+request. Together these cover sale dates from January 2015 through December
+2025, eleven calendar years of sales. No MLS data is used.
 
-**Not used:** MLS data (excluded per project scope — bulk extraction from
-MLS violates its terms of service). Everything here comes from county
-public records.
+**Sales history (`historical_sales.py`).** Each annual SDF covers roughly
+18–20 months of sales, so consecutive files overlap and the same sale appears
+more than once. I stacked all ten files and deduplicated on parcel, sale year,
+sale month, price, and recording reference (OR book/page, or clerk instrument
+number). Sale dates are only given to the month, so price alone is not a safe
+key. 319 groups had the same recorded instrument but disagreeing fields across
+files; those were resolved by keeping the later file. The result is **945,592
+distinct sales**, of which 421,426 are qualified arm's-length and 156,810 are
+qualified single-family.
 
-## Underwriting signals — what's real and why
+**Qualification-code harmonization.** Every sale carries a DOR qualification
+code. Only codes `01` and `02` (qualified arm's-length) are used as comps or
+outcomes. Before relying on that across eleven years, I checked the code
+definitions in three DOR document vintages (effective 2015, 2018, and 2024;
+the first two are only available through the Wayback Machine). Codes `01` and
+`02` are worded identically in all three. The one change is code `21`
+(contract for deed), added in 2018. It is a disqualified code either way, so
+the arm's-length set is the same across the whole window.
 
-Three signals, computed per parcel from the NAL file:
-
-1. **Absentee ownership** — the owner's mailing address (normalized string
-   comparison, not just ZIP) differs from the property's situs address, or
-   the mailing ZIP differs from the situs ZIP. Rationale: an owner who
-   doesn't live at the property is more reachable for an off-market offer
-   and less likely to have an emotional attachment driving up their price
-   expectation. `out_of_state` is tracked as a separate flag (mailing state
-   isn't Florida) for filtering, not folded into the score.
-2. **Ownership tenure** — years since the most recent recorded sale (from
-   `SALE_YR1`). Long tenure often correlates with either a paid-off
-   mortgage (motivated, flexible seller) or an aging/inherited situation.
-   **Caveat:** ~88% of single-family parcels have no recorded sale at all
-   in the NAL file. We treat a blank sale year as "long-tenured" (capped at
-   100 years) rather than dropping it from the average — the alternative
-   (silently averaging only the ~12% with a recent sale) is a real bug we
-   found and fixed; see "Known limitations" for why even the fix is a
-   judgment call, not a fact.
-3. **Equity proxy** — `just_value − last recorded sale price`, exposed as
-   both a dollar figure and an annualized % (using ownership tenure). This
-   is **explicitly not real equity** — see limitations below. It's null
-   for any parcel without a qualifying recorded sale (~95% of parcels),
-   which is most of them; we return null rather than guess.
-
-**Cut from v1 — not implemented:**
-- **Tax delinquency**: Miami-Dade Tax Collector publishes a real bulk PDF
-  of delinquent parcels, but it's a once-a-year snapshot requiring PDF
-  table extraction, and it's not yet built. To add it: download the
-  current year's PDF from mdctaxcollector.gov, extract the folio list, and
-  join it to `parcels.csv` on `parcel_id`.
-- **Pre-foreclosure / lis pendens**: no free bulk source exists. The Miami-
-  Dade Clerk of Courts offers a paid "Commercial Data Services" bulk
-  subscription ($110/month per data folder + notarized registration), but
-  their own documentation doesn't confirm lis pendens filings are broken
-  out in it without paying to see the file layout. The only free option is
-  per-document search, which we were explicitly told not to script
-  against. Cut for v1; revisit if the paid subscription is worth it to you.
-- **Probate activity**: removed entirely. The prior version of this tool
-  carried it as a signal with no ingestion behind it — a placeholder that
-  silently contributed a constant score to every parcel and compressed the
-  output's grade distribution. A signal that isn't measured isn't scored.
-
-## Qualification codes — the arm's-length definition, verified across 2015-2025
-
-`historical_sales.py` stacks Miami-Dade SDF (Sale Data File) records from 10
-Final-roll vintages (2016F-2025F, received via DOR public-records request),
-covering sale dates 2015-01 through 2025-12. Every sale carries a DOR
-`QUAL_CD`. Two codes are treated as arm's-length and usable as comps or
-back-test outcomes — everything else is excluded:
-
-| Code | Meaning | Arm's-length? |
+| Code | Meaning | Used? |
 |---|---|---|
-| `01` | Qualified arm's length — examination of the deed/instrument | **Yes** |
-| `02` | Qualified arm's length — documented evidence | **Yes** |
-| `03`-`06` | Arm's length at time of transfer, but excluded from DOR's own sales-ratio analysis (property/legal characteristics changed, multi-parcel, crosses county lines) | No |
-| `11`-`21` | Disqualified by deed type (corrective/quitclaim/tax deed, foreclosure-related, government, bankruptcy, utility, contract-for-deed, etc.) | No |
-| `30`-`43` | Disqualified by documented evidence (related-party, forced sale, atypical financing, etc.) | No |
-| `98`-`99` | Qualification decision pending / unresolved | No |
+| `01`, `02` | Qualified arm's length | Yes |
+| `03`–`06` | Arm's length but excluded from DOR's ratio study (characteristics changed, multi-parcel, etc.) | No |
+| `11`–`21` | Disqualified by deed type (quitclaim, tax deed, foreclosure-related, etc.) | No |
+| `30`–`43` | Disqualified by evidence (related party, forced sale, atypical financing, etc.) | No |
+| `98`–`99` | Pending | No |
 
-**This mapping was checked against three actual DOR document vintages, not
-assumed to be constant**: the code list effective 2015-01-01 (Rev.
-10-03-2014), 2018-01-01 (Rev. 11-17-2017), and 2024-01-01 (Rev. 9-14-2023).
-DOR no longer hosts the first two live; they were retrieved via the Wayback
-Machine. **Codes `01`/`02` are worded identically in all three** — the
-arm's-length definition has not changed across the whole 2015-2025 window
-this project uses. One real change did turn up: code `21` ("Contract for
-Deed; Agreement for Deed") was added in the 2018 revision and does not exist
-in the 2015 vintage — it's a disqualified code regardless, so it doesn't
-affect the arm's-length set, but a sale recorded before 2018 could not have
-carried it.
+Sources: [2015 vintage](https://web.archive.org/web/20180426230727/http://floridarevenue.com/property/Documents/salequalcodes_bef01012016.pdf),
+[2018 vintage](https://web.archive.org/web/20210621225107/https://floridarevenue.com/property/Documents/salequalcodes_bef01012019.pdf),
+[2024 vintage](https://floridarevenue.com/property/Documents/salequalcodes_bef01012025.pdf).
 
-- 2015 vintage: [web.archive.org/web/20180426230727/.../salequalcodes_bef01012016.pdf](https://web.archive.org/web/20180426230727/http://floridarevenue.com/property/Documents/salequalcodes_bef01012016.pdf)
-- 2018 vintage: [web.archive.org/web/20210621225107/.../salequalcodes_bef01012019.pdf](https://web.archive.org/web/20210621225107/https://floridarevenue.com/property/Documents/salequalcodes_bef01012019.pdf)
-- 2024 vintage (live): [floridarevenue.com/property/Documents/salequalcodes_bef01012025.pdf](https://floridarevenue.com/property/Documents/salequalcodes_bef01012025.pdf)
+A separate `MULTI_PAR_SAL` flag can be set on a qualified sale. It means the
+price covers a bundle of parcels. 287 qualified sales (0.07%) carry it, and
+they are excluded from comps.
 
-## ARV methodology
+**Parcel snapshots.** For each vintage I also kept every single-family
+parcel's living area, year built, neighborhood code, assessed ("just") value,
+and owner mailing address. That makes it possible to describe a parcel as it
+was in a given year rather than as it is today.
 
-Comp-based, built entirely from recorded arm's-length sales in the NAL file
-— no typed-in numbers, no synthetic data.
+**Parcel ID stability.** 92.5% of parcel IDs appear in every vintage. Of the
+IDs that disappear between years, 14.4% reappear under a new ID with the same
+owner and address (splits, combinations, or renumbering). These are flagged
+but not relinked.
 
-- **Comp geography**: the property appraiser's own `NBRHD_CD` (valuation
-  neighborhood) code, not ZIP (too coarse — a ZIP can span very different
-  submarkets) and not a lat/lon radius (the NAL file carries no
-  coordinates; adding one would mean introducing an external geocoding
-  dependency, out of scope here).
-- **Comp filters**: living area within ±20%, year built within ±15 years,
-  sold within the trailing 24 months, qualification code `01` or `02`
-  (Florida DOR's own "arm's-length, included in sales ratio analysis"
-  codes — see [floridarevenue.com/property/Documents/salequalcodes_bef01012025.pdf](https://floridarevenue.com/property/Documents/salequalcodes_bef01012025.pdf)).
-- **Minimum comp count**: 5. Below that, `arv_estimate` is null — the tool
-  does not guess.
-- **Price/sqft**: median of the comp set, after trimming values outside
-  1.5× IQR (guards against one data-entry error or atypical sale skewing a
-  thin comp pool).
-- **No market-time adjustment.** The 24-month window is the only control
-  on comp staleness; a proper adjustment would need a repeat-sales price
-  index built from more data than we have.
-- **Confidence**: every ARV carries `arv_comp_count` and
-  `arv_dispersion_pct` (IQR ÷ median $/sqft). Use them — see limitations.
+## ARV method (`historical_arv.py`)
 
-Ranking: `spread_estimate = (ARV × 70%) − just_value`. The 70% figure
-matches the MAO calculator's own default rule. `just_value` (current
-assessed value) stands in for acquisition basis because we have no
-listing-price or actual-offer data — it is a proxy, not a true basis.
+The ARV is computed **as of** a date D and uses nothing dated on or after D.
 
-## Back-test design and result
+- **Comps:** qualified, non-multi-parcel single-family sales in the same DOR
+  neighborhood code, within ±20% living area and ±15 years built, sold in the
+  36 months before D. The parcel's own sales are excluded.
+- **Same-vintage characteristics:** each comp's living area and year built
+  come from the roll for the year it sold, not today's roll. A house that was
+  1,400 sq ft when it sold in 2017 and was expanded to 2,200 in 2022 is
+  compared as a 1,400 sq ft house. Of 156,779 comp-eligible single-family
+  sales, 129,849 could be matched to a same-year snapshot.
+- **Subject characteristics:** for D = January 1 of year Y, the subject is
+  described by the Y−1 roll, because the year-Y roll is not certified until
+  that fall.
+- **Time adjustment:** comp prices per square foot are adjusted to D with a
+  county-wide monthly index. The index is rebuilt for every D from sales
+  before D only, and held flat after the last complete year rather than
+  extrapolated.
+- **Estimate:** median adjusted $/sq ft after trimming outliers beyond 1.5×
+  IQR, times the subject's living area. If restricting comps to the subject's
+  own assessed-value tercile within the neighborhood gives a tighter comp set,
+  that set is used. Fewer than 5 comps means no ARV.
+- **Confidence gate:** an ARV is "high confidence" if it has at least 8 comps
+  and comp dispersion (IQR ÷ median $/sq ft) of 30% or less.
 
-**There was no prior back-test in this codebase** — no file, no captured
-methodology. This one was built from scratch, and the validation
-population was derived directly from the NAL file's own sale records (not
-from an externally supplied transaction list):
+`spread_estimate` = ARV × 70% − just value, and `pct_spread` = spread ÷ ARV.
+The just value stands in for acquisition cost because there is no listing or
+offer data. It is a proxy, not a price.
 
-- A **flip candidate** = a parcel with two recorded, qualified arm's-length
-  sales where the earlier one (acquisition) is 6–18 months before the
-  later one (exit), with an exit price at least 10% above the acquisition
-  price.
-- Of 559 Miami-Dade single-family parcels with two qualified arm's-length
-  sales on record, 329 have SALE_1 (documented as "the first selected
-  sale") not actually later than SALE_2. This is **not** a data error —
-  Florida DOR's own 2025 User's Guide states plainly that "sale selection
-  is not necessarily based on chronological occurrence"; SAL1/SAL2 are
-  whichever two sales DOR judged "most suitable for statistical analysis,"
-  not guaranteed most-recent-first. (An earlier draft of this README
-  guessed this was corrective/re-recorded deeds — that guess was wrong and
-  has been corrected here.) Our code never relied on the slot labels for
-  ordering: `backtest.py` derives acquisition-vs-exit strictly from the
-  actual `sale1_date`/`sale2_date` values, so this DOR quirk doesn't
-  invalidate the population, it just means the label names are not
-  informative on their own. Of the 559, 230 have SALE_1's actual date
-  later than SALE_2's; of those, **39 met the 6–18 month / ≥10% gain flip
-  definition** — this is the validation population.
-- **No-lookahead rule**: each flip is scored as of its acquisition month.
-  Comps, the neighborhood comp pool, and the field of competing parcels it's
-  ranked against all exclude any sale on or after that date — including
-  the flip's own future exit sale.
+## ARV accuracy
 
-**Result: 2 of 39 known flips (5.1%) landed in the top decile of the
-model's ranked output.** Of the 39, only 23 could actually be scored at
-all — the other 16 fell in a comp window with too little (in 7 cases,
-*zero*) sale history to rank against (see below). Restricting to just the
-23 that got a real ranking: **2 of 23 (8.7%)**. Either way this is at or
-below the ~10% you'd expect from picking randomly — this model, as built,
-is **not** currently better than chance at spotting these flips in
-advance. Full detail in `data/backtest_results.csv`.
+The table compares each ARV as of January 1 with the parcel's first qualified,
+non-multi-parcel single-family sale in the next 12 months. Error is
+|ARV − price| ÷ price.
+"Before fix" is the leaky version described in the next section.
 
-*(You previously recalled 12 of 15 from an earlier version of this
-project. That number isn't reproducible from anything in this codebase —
-no back-test file or methodology survived, and the two other copies of
-this project found on disk before this rebuild — see Phase 1 assessment —
-didn't contain one either. The number above is the real, current,
-from-scratch result, not a comparison to that recollection.)*
+| As of | Group | n | Median error (before fix → after) | Mean error | Within 10% | Within 20% |
+|---|---|---|---|---|---|---|
+| 2018 | All | 12,493 | 10.5% → **11.3%** | 16.2% | 44.8% | 74.8% |
+| | High confidence | 9,981 | 9.2% → **10.1%** | 13.0% | 49.8% | 81.2% |
+| 2019 | All | 12,730 | 9.8% → **10.0%** | 15.0% | 49.9% | 77.9% |
+| | High confidence | 10,640 | 8.8% → **8.9%** | 12.5% | 54.8% | 83.6% |
+| 2020 | All | 13,261 | 9.9% → **10.7%** | 14.7% | 47.4% | 77.5% |
+| | High confidence | 11,207 | 8.9% → **9.7%** | 12.7% | 51.5% | 82.3% |
+| 2021 | All | 16,581 | 12.1% → **15.7%** | 21.8% | 31.6% | 62.6% |
+| | High confidence | 13,778 | 10.8% → **14.6%** | 18.8% | 34.0% | 67.3% |
 
-**Why it's this low — three real, disclosed reasons, not tuning excuses:**
+Mean and within-X% columns are after the fix. Low-confidence ARVs (the other
+~15–20% of each year) have median errors of 19.6–25.3%, which is why the
+default view gates on confidence. 2021 is worse, most likely because prices
+rose quickly during 2021 and the engine can only use the 2020 price level on
+January 1, 2021.
 
-1. **The NAL file's sale history is structurally shallow — this is
-   confirmed against DOR's own spec, not a parsing bug.** `SALE_YR1`/
-   `SALE_YR2` across the *entire* Miami-Dade file contain no dates earlier
-   than January 2024 (verified independently with Python's raw `csv`
-   module, bypassing pandas and this project's pipeline entirely — see
-   "Historical data" below). The reason is documented in the Florida DOR
-   **2025 User's Guide, Department Property Tax Data Files**
-   ([floridarevenue.com/property/dataportal/Documents/PTO%20Data%20Portal/User%20Guides/2025%20Users%20guide%20and%20quick%20reference/2025_NAL_SDF_NAP_Users_Guide.pdf](https://floridarevenue.com/property/dataportal/Documents/PTO%20Data%20Portal/User%20Guides/2025%20Users%20guide%20and%20quick%20reference/2025_NAL_SDF_NAP_Users_Guide.pdf)):
-   the NAL's sale fields are merged in from the **Sale Data File (SDF)**,
-   which by design "includes only parcels that transferred ownership
-   during the year immediately preceding the January 1 assessment date
-   and the sales that occurred after the January 1 assessment date up to
-   the required submission date" — roughly an 18-20 month window, every
-   year, for every Florida county. **This is a permanent structural
-   ceiling on the single-year NAL file, not something a different parse
-   or a bug fix would recover.** It means a flip acquired in January 2024
-   has *zero* possible comps in a trailing-24-month window, because the
-   window reaches back before any sale data exists in this file at all.
-   The fix is ingesting multiple years of NAL/SDF (see "Historical data"
-   below), not re-reading this one differently.
-2. **Small, noisy sample.** 23-39 flips is not a lot of signal; a couple
-   of hits either way swings the percentage by 4-5 points.
-3. **The flip population may not be the right test of what this tool
-   screens for.** A "flip" here is defined purely by price appreciation
-   over a short hold — it says nothing about whether the *seller* was
-   motivated at acquisition. The tool's actual distress signals (absentee
-   ownership, tenure, equity proxy) aren't used in this ranking at all —
-   only `spread_estimate` (ARV vs. assessed value) is. So this back-test
-   measures the ARV/spread engine's retrospective accuracy, not the
-   distress-signal screening that's the tool's actual differentiator. We
-   have no ground truth for "was this owner motivated," so that half of
-   the tool remains unvalidated by this or any back-test we could build
-   from NAL data alone.
+## The look-ahead leak
 
-Nothing was adjusted to change this number. If you want to try a different
-holding-period window, price-gain threshold, or top-quintile instead of
-top-decile, say so explicitly and I'll rerun and report both the before
-and after — not just the after.
+**What it was.** The first version built one time-adjustment index from the
+whole 2015–2025 dataset and reused it for every as-of date. Each year's index
+point was that year's full-year median, anchored at July 1, with interpolation
+between. For D = January 1, 2021, the index value at D was interpolated
+between the July 2020 and July 2021 anchors, and the July 2021 anchor is built
+from sales that hadn't happened yet. In a rising market this quietly borrowed
+future appreciation.
 
-**Known caveat on the back-test's ranking mechanics**: the NAL file is a
-single 2025 snapshot — there's no historical time series of assessed
-values. When scoring a flip "as of" an earlier acquisition date, its
-competing parcels' `just_value` still reflects 2025 assessments, not what
-they were assessed at then. This lookahead is applied uniformly to every
-parcel being ranked at a given date, so it shouldn't systematically favor
-the flip candidates over the rest of the field — but it does mean the
-back-test measures *relative* ranking ability more cleanly than it
-measures *absolute* dollar accuracy of `spread_estimate` at any historical
-point.
+**How it was found.** While reviewing the method before running the
+back-test, I asked whether the index value used at D could depend on any sale
+dated on or after D. It could. The comp pool already had an assertion against
+post-D sales, but the index was built outside that check.
 
-## Historical data — status and how to get it
+**How much it mattered.** At each D the leaky index overstated the price
+level by +4.0% (2018), +2.4% (2019), +4.4% (2020), and +9.9% (2021). That
+made median error look 0.1 to 3.8 points better than it really was (table
+above). The leak was worst in 2021, when the market moved most.
 
-The single-year NAL file caps comp and back-test history at ~20 months
-(see above). Getting past that requires **additional years of NAL/SDF**,
-which Florida DOR does not publish for bulk download except for the
-current assessment year — confirmed directly against the live DOR data
-portal, which currently lists only `2026F`/`2026P` in its NAL directory.
+**Fix and verification.** The index is now rebuilt from pre-D sales only, and
+asserts that no anchor falls on or after D. At every D it equals the prior
+year's median exactly. The stronger check is the invariance test in
+`verify_lookahead_fix.py`: delete every sale dated on or after January 1,
+2021 from the inputs and rerun. The index, the ARVs (a 40,000-parcel sample),
+and the back-test signals all came out bit-for-bit identical, so nothing
+downstream reads data from the future. The same script confirms the
+look-ahead assertion fires on leaky input; it caught 2,334 post-D rows.
 
-Per DOR's Data Portal page (floridarevenue.com/property/Pages/DataPortal_RequestAssessmentRollGISData.aspx):
+## Back-test design (`backtest_discount.py`)
 
-> "Only the most current version of each roll type is posted on our
-> website. Data from previous years or prior rolls from the current year
-> are available by request. ... The available tax rolls are: Preliminary
-> and Final NAL and NAP files from **2002 to the current year**. Sale
-> files from **2009 to the current year**."
+- **As-of dates:** January 1 of 2018, 2019, 2020, and 2021.
+- **Subjects:** every single-family parcel on the prior year's roll (373,089
+  to 377,943 per year).
+- **Default population:** high-confidence ARV and at least $25,000 spread,
+  the same filter the app uses: 32,741 / 35,555 / 40,024 / 69,631 parcels.
+  Results are also reported for an ungated population (every parcel with an
+  ARV) in the results CSV.
+- **Signals, all computed as of D:** `pct_spread`; absentee (owner mailing
+  address or ZIP differs from the property's); tenure (time since last
+  recorded sale); equity proxy (just value minus last qualified sale price);
+  and an equal-weight composite of all four.
+- **Outcomes, over the 30 months after D:**
+  - **Discount:** among parcels that had a qualified sale, did it close 20%
+    or more below the as-of ARV?
+  - **Any sale:** did the parcel have any qualified sale? No valuation is
+    involved.
+  - **Below just value:** among parcels that sold, was the price below the
+    DOR just value from the roll before the sale year? This does not use the
+    ARV.
+- **Comparisons:** for continuous signals, the top 10% versus the bottom 50%,
+  with a seeded random tie-break (at most 2.7% of rows tie at the cutoff).
+  Yes/no signals (absentee; "no sale on record since 2015") are compared as
+  groups, because slicing a decile out of a mostly tied column lets row order
+  decide who is in it. The base rate always comes from the same population
+  being compared.
+- **Multiple testing:** 144 comparisons in all, so the Bonferroni cutoff is
+  p < 0.00035. Results below are marked as significant only if they pass it.
+- **No tuning:** composite weights were fixed at equal quarters before any
+  outcome was looked at, and nothing was reweighted afterward.
 
-So Miami-Dade NAL/SDF for 2016-2025 should exist, but it's **request-only**
-— email `PTOTechnology@floridarevenue.com` (or fax/mail/phone; an optional
-request form is also available), specifying county, year(s), and roll
-type. No stated fee; turnaround isn't published. **This request has been
-submitted** (NAL + SDF, Miami-Dade, 2016-2025) as of this writing —
-turnaround unknown. This is a manual-request data source exactly like the
-tax-delinquency PDF: ingestion code is written to read from locally-placed
-files, never to fake a pull.
+## Results
 
-**Ingestion is written and waiting, not yet runnable**: `historical_sales.py`
-stacks whatever NAL/SDF vintages land in `data/raw/historical/`, keyed for
-dedup on `(parcel_id, sale_year, sale_month, sale_price, qual_code)`, and
-does not assume SALE_1 is chronologically later than SALE_2 (see the
-non-chronological-slot finding above) — ordering is always derived from
-the actual date values. It includes a stub for SDF's different layout
-(`SALE_ID_CD` per transaction, not a fixed SAL1/SAL2 pair) that hasn't
-been exercised against a real SDF file yet. **This code is unvalidated**
-— it was written against the known 2025 schema and reasoned expectations
-about SDF, not against real multi-year files, because none exist locally
-yet. Treat every assumption in it as provisional until it's run against
-real 2016-2025 data and the per-year sale-date distributions are checked
-(see the discipline in `backtest.py`'s original single-year investigation
-— same standard applies here: if a year's dates don't land in that year's
-expected ~18-20 month window, stop and report it, don't silently coerce).
+All figures are for the default population, as of 2018 / 2019 / 2020 / 2021.
 
-**A bias to watch for once the data arrives**: joining a historical sale
-to *current-roll* parcel characteristics (today's living area, year built,
-DOR use code) assumes nothing physically changed at the parcel between
-the sale and now. A parcel renovated, expanded, or rebuilt since a 2018
-sale would have its 2018 sale price compared against 2025 characteristics
-that didn't exist in 2018 — corrupting both comps and any back-test that
-uses it. Having per-year NAL files (rather than one snapshot) fixes this
-properly: each vintage carries the parcel's characteristics *as they were
-assessed that year*, so a historical sale can be matched to
-period-appropriate living area/year-built/use-code instead of today's.
-`historical_sales.py` is structured to carry each vintage's own parcel
-snapshot alongside its sales for this reason, but the actual
-period-matching logic isn't built yet — it can't be tested without real
-multi-year files.
+### 1. `pct_spread` predicts discount-to-ARV, but not whether a home sells
 
-## Known limitations — what a skeptical reviewer would poke holes in
+Among homes that sold, the top 10% by `pct_spread` sold 20%+ below ARV far
+more often than the bottom half:
 
-- **Equity proxy is not equity.** It ignores any mortgage or lien balance
-  entirely. Worse, Florida's Save Our Homes assessment cap can keep
-  `just_value` well below true market value for long-held homesteaded
-  parcels — which biases this proxy *low* for exactly the owners most
-  likely to have real, substantial equity. Treat it as a rough, directional
-  signal, not a number to underwrite against.
-- **Spread estimates get unreliable at the extremes.** In ultra-luxury
-  waterfront submarkets (found during testing: Pine Tree Dr, Hibiscus Dr,
-  and Di Lido Dr on Miami Beach; Edgewater Dr in Coral Gables), the top of
-  the spread-sorted leaderboard is dominated by parcels with old, modest
-  assessed values sitting in the same `NBRHD_CD` as newly-built mega-
-  mansions selling for 3–8× more per square foot. The comp-count and
-  dispersion figures correctly flag these as low-confidence (dispersion
-  32–58% vs. a 19.7% median, comp counts right at the 5-minimum floor), but
-  the leaderboard's plain sort by `spread_estimate` doesn't yet *filter* on
-  that confidence — so the least trustworthy estimates currently surface
-  first unless you tighten the sidebar's dispersion/comp-count filters
-  yourself. Filtering this automatically wasn't added post-hoc precisely
-  because it was discovered late — see the project notes on not tuning to
-  fit intuition.
-- **Ownership tenure has a resolution problem.** ~88% of single-family
-  parcels have no recorded sale in the NAL file at all, so they're all
-  pinned at the 100-year tenure ceiling. The signal only meaningfully
-  discriminates among the ~12% of parcels with an actual sale on record.
-- **Absentee-address matching is exact-normalized-string, not fuzzy.**
-  Minor formatting differences between how the same address is written in
-  the owner-mailing vs. situs fields could produce false positives; the
-  ZIP cross-check reduces but doesn't eliminate this.
-- **No condition/finish-level data anywhere.** The comp model can't tell a
-  gut-renovated interior from a 1970s original — every dollar figure here
-  assumes "typical for its cohort," which is a real source of error at the
-  parcel level even when the comp pool is solid.
-- **The NAL file's sale history is structurally shallow — every recorded
-  sale date in it falls between January 2024 and September 2025, by
-  design (see "Historical data" above for the DOR spec citation).** For
-  the current production ARV (which looks back from "now") this doesn't
-  matter — the full window has data. It matters for anyone trying to run
-  comps or a back-test "as of" an earlier date, where the trailing
-  lookback window can run out of data entirely. Fix in progress: a
-  multi-year records request has been submitted; ingestion code exists
-  but is unvalidated until those files arrive.
-- **Two of four target distress signals are simply not in this build**
-  (tax delinquency, pre-foreclosure/lis pendens) — see "Cut from v1" above.
-  Ranking currently rests on absentee ownership, tenure, and equity proxy
-  only.
-- **Validated on one county.** Broward and Palm Beach ingestion code runs,
-  but hasn't been checked against real output the way Miami-Dade has.
+| | 2018 | 2019 | 2020 | 2021 |
+|---|---|---|---|---|
+| Top 10% | 52.5% | 55.3% | 33.3% | 21.6% |
+| Bottom 50% | 13.5% | 13.0% | 6.8% | 2.7% |
 
-## Setup / run
+All four are significant. But the ranking says nothing about whether a home
+sells. The top 10% sold at 8.2% / 7.7% / 8.4% / 9.1%, against 8.5% / 10.3% /
+10.8% / 9.0% for the bottom half. In 2019 and 2020 the top-ranked homes were
+slightly *less* likely to sell.
+
+**Self-consistency caveat.** The discount outcome is measured against the
+tool's own ARV, and `pct_spread` is large exactly when the ARV is high
+relative to the just value. If the ARV overestimates a home's value, that home
+ranks high **and** its eventual sale looks like a discount. The two errors are
+the same error. So part of this result is probably the ARV grading itself.
+The below-just-value outcome avoids that problem because it doesn't use the
+ARV, and there `pct_spread` shows no lift: 1.8% vs 1.9%, 1.1% vs 1.7%, 0.2% vs
+0.8%, 0.0% vs 0.6%. That check is weak, though. Only 0.4–1.6% of sales in this
+population closed below just value, so it has little power. The honest
+reading is that the ranking picks out homes whose sale prices land well under
+the model's estimate. How much of that is a real bargain and how much is model
+error, this data can't separate.
+
+The equal-weight composite did worse than `pct_spread` alone on the discount
+outcome (26.1% vs 16.9% in 2018, the only year that passes the cutoff). Min-max
+scaling squeezed `pct_spread` into a very narrow range (standard deviation
+0.17–0.19, against 35–46 for absentee and tenure), so the "equal" composite
+was effectively absentee plus tenure.
+
+### 2. Absentee ownership shows nothing usable
+
+| | 2018 | 2019 | 2020 | 2021 |
+|---|---|---|---|---|
+| Discount: absentee vs not | 22.9% vs 18.4% | 21.5% vs 21.0% | 13.3% vs 11.7% | 6.4% vs 5.7% |
+| Any sale: absentee vs not | 8.6% vs 8.6% | 9.5% vs 9.9% | 9.7% vs 10.5% | 9.8% vs 9.2% |
+
+None of these pass the multiple-testing cutoff, the ungated population looks
+the same, and the direction isn't consistent. Absentee owners made up about
+14–15% of the default population.
+
+### 3. Tenure: censored at 2015, and long tenure means fewer sales
+
+The sales history starts in January 2015, so observed tenure tops out at about
+three years for the 2018 as-of date and six years for 2021. A home that last
+sold in 1998 and one that has never sold look the same. In practice the tenure
+signal reduces to "has a recorded sale since 2015, or not," and 66–79% of the
+default population has none.
+
+That group sold **less**, not more:
+
+| | 2018 | 2019 | 2020 | 2021 |
+|---|---|---|---|---|
+| Any sale: no sale since 2015 | 7.2% | 8.1% | 8.5% | 8.0% |
+| Any sale: sold since 2015 | 13.9% | 14.8% | 14.7% | 11.6% |
+| Relative difference | −48% | −45% | −42% | −31% |
+
+All four years are significant (the ungated population shows −29% to −40%).
+This data doesn't say why, but it runs against the premise that long-held
+homes are the likeliest to come to market. When these
+homes did sell, they were slightly more likely to sell at a discount (20.6% vs
+16.1% in 2018), but no year passes the cutoff.
+
+Among homes that *do* have a sale since 2015, longer tenure leaned toward
+fewer sales (12.2% vs 15.6% in 2018, for example), but no year passes the
+cutoff on any outcome.
+
+**Equity proxy** only exists for parcels with a qualified sale since 2015
+(10–17% of the default population), and its results on both the discount and
+below-just-value outcomes partly reuse the same just value those outcomes
+depend on. I don't treat it as evidence either way.
+
+## Limitations
+
+- **The ranking is validated on discount-to-ARV only,** and that outcome is
+  partly self-referential (see above). No outcome here measures whether an
+  owner would have accepted an off-market offer.
+- **Just value is not a price.** Florida's Save Our Homes cap and assessment
+  lag mean just value can sit well below market for long-held homesteaded
+  homes. That inflates `spread_estimate` for exactly those homes.
+- **No condition data.** The comps can't tell a renovated interior from an
+  original one. Every ARV assumes "typical for its cohort."
+- **Tenure is censored at 2015,** as described above.
+- **Subject characteristics lag by up to a year,** since the as-of-January
+  subject is described by the prior year's roll.
+- **County-wide time index.** Neighborhoods that appreciated faster or slower
+  than the county get a biased adjustment. This contributes to the 2021 error.
+- **Renumbered parcels are not relinked,** so some sale histories are split
+  across two IDs.
+- **Miami-Dade single-family only.** `data_pipeline.py` can read Broward and
+  Palm Beach NALs, but nothing outside Miami-Dade has been validated.
+- **Not in the data:** tax delinquency (Miami-Dade publishes a free annual
+  PDF, not yet ingested), lis pendens / pre-foreclosure (no free bulk source),
+  and probate.
+- **The app's ranking is as of January 1, 2026,** built from comps recorded
+  through September 2025, the latest qualified single-family sale in the
+  data.
+
+## Repository layout
+
+| File | What it does |
+|---|---|
+| `historical_sales.py` | Builds the deduplicated 2015–2025 sale history and per-vintage parcel snapshots from the DOR files |
+| `historical_arv.py` | As-of ARV engine: comps, time index, confidence gate, spread columns |
+| `backtest_discount.py` | The back-test described above; writes `data/backtest_discount_results.csv` |
+| `verify_lookahead_fix.py` | Before/after accuracy, the delete-the-future invariance test, and the assertion check |
+| `data_pipeline.py` | Parses the current (2025) NAL into `data/parcels.csv`: owner, mailing, and signal fields for the app |
+| `app.py` | Streamlit screener. Default view: high-confidence ARV, $25K+ spread, sorted by `pct_spread` |
+| `scorer.py` | Motivation grade (absentee / tenure / equity composite) shown in the app, labeled as not validated |
+| `arv.py`, `backtest.py` | Earlier single-year ARV and flip back-test, superseded by the multi-year versions above |
+
+## Setup
 
 ```bash
 pip install -r requirements.txt
-
-# 1. Download the Miami-Dade NAL 2025 zip from the Florida DOR property tax
-#    data portal and place it at data/raw/Dade 23 Final NAL 2025.zip
-#    (Broward/Palm Beach files go in the same folder if you want to try
-#    the multi-county path — see data_pipeline.py's COUNTIES dict for the
-#    exact expected filenames.)
-
-python3 data_pipeline.py          # writes data/parcels.csv
-python3 backtest.py               # optional — reruns the back-test, writes data/backtest_results.csv
-streamlit run app.py              # opens the leaderboard at localhost:8501
-
-# Once multi-year NAL/SDF arrive from the DOR records request (see
-# "Historical data" below), place them under data/raw/historical/ and run:
-python3 historical_sales.py       # UNVALIDATED until real files exist — see its docstring
 ```
 
-## Raw data is not committed
+The raw DOR files are not in this repo. Place the Miami-Dade Final NAL and SDF
+zips for 2016–2025 at `data/raw/historical/NAL/<year>F.zip` and
+`data/raw/historical/SDF/<year>F.zip`, and the 2025 NAL at
+`data/raw/Dade 23 Final NAL 2025.zip`. Then:
 
-`data/raw/` (the county NAL zip files, including `data/raw/historical/`
-once multi-year files arrive) and the derived `data/parcels.csv` /
-`data/historical_sales.csv` are excluded via `.gitignore` — they're large,
-and the derived files carry real owner names and addresses pulled from
-public records, which we'd rather not publish to a public repo by default
-even though the source is public. Regenerate by downloading the NAL files
-(see Setup above) and running `data_pipeline.py` / `historical_sales.py`.
+```bash
+python3 historical_sales.py      # sale history + parcel snapshots (parquet)
+python3 data_pipeline.py         # data/parcels.csv for the app
+python3 backtest_discount.py     # back-test results
+python3 verify_lookahead_fix.py  # leak check and accuracy table
+streamlit run app.py
+```
+
+Raw and derived data files are excluded by `.gitignore`. They are large, and
+the derived files include owner names and mailing addresses. Those are public
+records, but I don't republish them.
