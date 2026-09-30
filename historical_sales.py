@@ -204,13 +204,34 @@ def build():
         errors="coerce",
     )
 
+    # MULTI_PAR_SAL is orthogonal to QUAL_CD: a sale can be "qualified" (01/02) AND
+    # part of a multi-parcel transaction at the same time -- meaning the recorded
+    # price covers a bundle of parcels, not this one. Comp-usable arm's-length
+    # sales must exclude these regardless of qual_code. See README "Qualification
+    # codes" for why this isn't code 02 (checked against 3 DOR vintages: 02 has
+    # always meant "documented evidence," never multi-parcel -- code 05 is the
+    # dedicated multi-parcel qual code, but MULTI_PAR_SAL can be set independently
+    # of qual_code entirely, which is the actual risk to guard against here).
+    deduped["multi_parcel_sale"] = deduped["MULTI_PAR_SAL"].notna() & (deduped["MULTI_PAR_SAL"] != "")
+    deduped["comp_eligible"] = deduped["qualified"] & (~deduped["multi_parcel_sale"])
+
+    n_qualified = int(deduped["qualified"].sum())
+    n_qualified_multi = int((deduped["qualified"] & deduped["multi_parcel_sale"]).sum())
+    print(f"\n=== Multi-parcel contamination check ===")
+    print(f"Qualified (01/02) sales: {n_qualified:,}")
+    print(f"Of those, also flagged MULTI_PAR_SAL (price covers a parcel bundle, not this "
+          f"one parcel alone): {n_qualified_multi:,} ({n_qualified_multi/n_qualified*100:.2f}%) "
+          f"-- excluded from comp_eligible regardless of qual_code.")
+    print(f"comp_eligible (qualified AND NOT multi-parcel) sales: {int(deduped['comp_eligible'].sum()):,}")
+
     out = deduped.rename(columns={
         "PARCEL_ID": "parcel_id", "SALE_YR": "sale_year", "SALE_MO": "sale_month",
         "SALE_PRC": "price", "QUAL_CD": "qual_code", "VI_CD": "vi_code",
         "DOR_UC": "dor_use_code",
     })[[
         "parcel_id", "sale_year", "sale_month", "price", "recording_ref",
-        "qual_code", "qualified", "vi_code", "dor_use_code", "sale_date", "source_year",
+        "qual_code", "qualified", "multi_parcel_sale", "comp_eligible", "vi_code",
+        "dor_use_code", "sale_date", "source_year",
     ]]
 
     out.to_parquet(OUTPUT_PARQUET, index=False)
@@ -273,6 +294,49 @@ def parcel_stability_report():
           "not done without sign-off.")
 
 
+NAL_SNAPSHOT_COLS = ["PARCEL_ID", "DOR_UC", "NBRHD_CD", "TOT_LVG_AREA", "ACT_YR_BLT", "JV",
+                      "PHY_ADDR1", "PHY_CITY", "PHY_ZIPCD"]
+NAL_SNAPSHOTS_PARQUET = Path("data/nal_snapshots.parquet")
+
+
+def build_nal_snapshots(dor_use_codes=("001",)) -> pd.DataFrame:
+    """
+    One row per (parcel, vintage_year), single-family only by default -- the
+    per-year characteristics needed for the same-vintage comp rule (a comp's
+    living area/year built/neighborhood as they were assessed in the comp's OWN
+    sale year, not as of today's roll) and for scoring a subject's own as-of
+    characteristics.
+    """
+    frames = []
+    for y in YEARS:
+        path = HIST_DIR / "NAL" / f"{y}F.zip"
+        with zipfile.ZipFile(path) as zf:
+            name = zf.namelist()[0]
+            with zf.open(name) as fh:
+                df = pd.read_csv(fh, usecols=NAL_SNAPSHOT_COLS, dtype=str, keep_default_na=False, na_values=[""])
+        for c in df.columns:
+            df[c] = df[c].str.strip()
+        df = df[df["DOR_UC"].isin(dor_use_codes)].copy()
+        df["vintage_year"] = y
+        frames.append(df)
+        print(f"  {y}F NAL: {len(df):,} single-family parcels")
+
+    out = pd.concat(frames, ignore_index=True).rename(columns={
+        "PARCEL_ID": "parcel_id", "NBRHD_CD": "nbrhd_cd", "TOT_LVG_AREA": "living_area",
+        "ACT_YR_BLT": "year_built", "JV": "just_value", "PHY_ADDR1": "situs_addr1",
+        "PHY_CITY": "situs_city", "PHY_ZIPCD": "situs_zip",
+    })
+    out["living_area"] = pd.to_numeric(out["living_area"], errors="coerce")
+    out["year_built"] = pd.to_numeric(out["year_built"], errors="coerce")
+    out["just_value"] = pd.to_numeric(out["just_value"], errors="coerce")
+
+    out.to_parquet(NAL_SNAPSHOTS_PARQUET, index=False)
+    print(f"Wrote {len(out):,} parcel-vintage snapshots -> {NAL_SNAPSHOTS_PARQUET}")
+    return out
+
+
 if __name__ == "__main__":
     build()
     parcel_stability_report()
+    print("\n=== Building per-vintage NAL snapshots (single-family) ===")
+    build_nal_snapshots()

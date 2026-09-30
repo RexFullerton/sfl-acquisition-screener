@@ -9,6 +9,7 @@ data/parcels.csv
 data/backtest_results.csv
 data/historical_sales.csv
 data/historical_sales.parquet
+data/nal_snapshots.parquet
 
 # Claude Code local session config (permissions allowlist, not project source)
 .claude/
