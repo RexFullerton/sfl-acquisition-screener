@@ -295,7 +295,8 @@ def parcel_stability_report():
 
 
 NAL_SNAPSHOT_COLS = ["PARCEL_ID", "DOR_UC", "NBRHD_CD", "TOT_LVG_AREA", "ACT_YR_BLT", "JV",
-                      "PHY_ADDR1", "PHY_CITY", "PHY_ZIPCD"]
+                      "PHY_ADDR1", "PHY_CITY", "PHY_ZIPCD",
+                      "OWN_ADDR1", "OWN_CITY", "OWN_STATE", "OWN_ZIPCD"]
 NAL_SNAPSHOTS_PARQUET = Path("data/nal_snapshots.parquet")
 
 
@@ -325,6 +326,8 @@ def build_nal_snapshots(dor_use_codes=("001",)) -> pd.DataFrame:
         "PARCEL_ID": "parcel_id", "NBRHD_CD": "nbrhd_cd", "TOT_LVG_AREA": "living_area",
         "ACT_YR_BLT": "year_built", "JV": "just_value", "PHY_ADDR1": "situs_addr1",
         "PHY_CITY": "situs_city", "PHY_ZIPCD": "situs_zip",
+        "OWN_ADDR1": "own_addr1", "OWN_CITY": "own_city", "OWN_STATE": "own_state",
+        "OWN_ZIPCD": "own_zip",
     })
     out["living_area"] = pd.to_numeric(out["living_area"], errors="coerce")
     out["year_built"] = pd.to_numeric(out["year_built"], errors="coerce")

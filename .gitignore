@@ -7,6 +7,8 @@ data/raw/
 # records; not committing it by default even though the source is public.
 data/parcels.csv
 data/backtest_results.csv
+data/backtest_discount_results.csv
+data/accuracy_before_after.csv
 data/historical_sales.csv
 data/historical_sales.parquet
 data/nal_snapshots.parquet
