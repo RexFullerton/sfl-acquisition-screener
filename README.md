@@ -1,14 +1,14 @@
 # South Florida Acquisition Screener
 
-I built this to test a common idea in residential acquisitions: that you can find motivated sellers from public records. Absentee owners, people who have owned for a long time, and owners sitting on a lot of equity are supposed to be the ones who sell off-market and below value. I wanted to know whether that holds up in actual data. So I built a screening tool for Miami-Dade single-family homes from Florida Department of Revenue (DOR) tax-roll records, then back-tested it against what really happened to those homes, using only information that existed at each point in time.
+Finding off-market sellers was the hardest part of the wholesale work I did with my family's company in Maryland, DC and Virginia. Most of our deals came from referrals and cold outreach. Since I go to school in Miami, I wanted to know two things: could public records do that search instead, and would the approach carry over to a different market? So I built a screening tool for Miami-Dade single-family homes from Florida Department of Revenue (DOR) tax-roll records, then back-tested it against what actually happened to those homes, using only information that existed at each point in time.
 
-Mostly, it didn't hold up. My comp-based valuation lands within about 10% median error of actual 2018-2020 sale prices. Ranking homes by the gap between that estimate and assessed value picks out homes that later sold well below the estimate, though part of that is the model grading itself (explained below), and the ranking says nothing about whether a home will sell. Absentee ownership predicted nothing I could use. Homes with no recorded sale since 2015 were 31-48% *less* likely to sell, the opposite of the long-tenure idea. I also found a look-ahead leak in my own valuation engine that had been making it look more accurate than it was.
+The valuation held up. The seller signals didn't. My comp-based valuation lands within about 10% median error of actual 2018-2020 sale prices. Ranking homes by the gap between that estimate and assessed value picks out homes that later sold well below the estimate, though part of that is the model grading itself (explained below), and the ranking says nothing about whether a home will sell. Absentee ownership predicted nothing I could use. Homes with no recorded sale since 2015 were 31-48% *less* likely to sell, the opposite of the long-tenure idea. I also found a look-ahead leak in my own valuation engine that had been making it look more accurate than it was.
 
 The tool runs locally as a Streamlit app. Its default view is the ranking the back-test measured.
 
 ## The data
 
-The first version used a single year of DOR data, and that turned out to be the main problem. The annual file only carries about 18-20 months of sales, so there wasn't enough history to value homes in the past or test anything. My first back-test caught 2 of 39 known flips in its top decile, which is no better than chance. DOR only posts the current year for download, so I filed a public-records request for older files. What I got back was 10 annual tax rolls covering 11 years of sales (2015-2025): the Miami-Dade NAL (parcel) and SDF (sale) Final rolls for 2016 through 2025. No MLS data is used anywhere.
+The first version used a single year of DOR data, and that turned out to be its biggest problem. The annual file only carries about 18-20 months of sales, so there wasn't enough history to value homes in the past or test anything. My first back-test caught 2 of 39 known flips in its top decile, which is no better than chance. DOR only posts the current year for download, so I filed a public-records request for older files. What I got back was 10 annual tax rolls covering 11 years of sales (2015-2025): the Miami-Dade NAL (parcel) and SDF (sale) Final rolls for 2016 through 2025. No MLS data is used anywhere.
 
 Because each annual sale file overlaps the next, the same sale shows up more than once. I stacked all ten years and deduplicated on parcel, sale year, sale month, price and recording reference (OR book and page, or the clerk's instrument number). Sales are only dated to the month, so price alone isn't a safe key. 319 groups had the same recorded instrument but disagreed across files, and I kept the later file's version. That leaves 945,592 distinct sales, of which 421,426 are qualified arm's-length and 156,810 are qualified single-family.
 
@@ -82,7 +82,7 @@ It doesn't predict whether a home sells. The top 10% sold at 8.2% / 7.7% / 8.4% 
 
 I don't read the discount result as proof the ranking finds bargains. The outcome is measured against my own estimate, and `pct_spread` is large exactly when the estimate is high relative to just value. If the model overvalues a home, that home ranks high and its eventual sale looks like a discount, from the same error. The below-just-value outcome avoids that, and there the ranking shows no lift: 1.8% vs 1.9%, 1.1% vs 1.7%, 0.2% vs 0.8%, 0.0% vs 0.6%. That check is weak, though, because only 0.4-1.6% of sales in this group closed below just value. The fair summary is that the ranking picks out homes whose sale prices land well under the model's estimate, and this data can't separate a real bargain from model error.
 
-The equal-weight composite did worse than `pct_spread` alone on the discount outcome (26.1% vs 16.9% in 2018, the only year that clears the cutoff). The way I scaled the inputs squeezed `pct_spread` into a very narrow range (standard deviation 0.17-0.19, against 35-46 for absentee and tenure), so the "equal" composite was really absentee plus tenure.
+The equal-weight composite did worse than `pct_spread` alone. On the discount outcome its top 10% came in at 26.1% against 16.9% for its bottom half in 2018, the only year that clears the cutoff, compared with 52.5% against 13.5% for `pct_spread`. The way I scaled the inputs squeezed `pct_spread` into a very narrow range (standard deviation 0.17-0.19, against 35-46 for absentee and tenure), so the "equal" composite was really absentee plus tenure.
 
 Absentee ownership showed nothing usable:
 
@@ -104,6 +104,10 @@ Tenure turned out to be mostly a data artifact. My sale history starts in Januar
 All four years are significant, and the wider population shows −29% to −40%. The data doesn't say why, but it cuts against the idea that long-held homes are the likeliest to come to market. When those homes did sell they were slightly more likely to sell at a discount (20.6% vs 16.1% in 2018), but no year clears the cutoff. Among homes that do have a sale since 2015, longer tenure leaned toward fewer sales (12.2% vs 15.6% in 2018, for example), but again nothing clears the cutoff.
 
 The equity proxy only exists for homes with a qualified sale since 2015 (10-17% of the default population), and its results reuse the same just value the discount and below-just-value outcomes depend on. I don't count it as evidence either way.
+
+## What I'd do next
+
+The question I started with, whether an owner would take an off-market offer, needs outcome data this project doesn't have: offers made and accepted. The next honest test is to pull a small, recent list from the default ranking, work it the way we worked leads at my family's company, and track response and conversion rates. On the data side, Miami-Dade's tax-delinquency list and probate filings are the two public signals I'd add first.
 
 ## Limitations
 
